@@ -5,6 +5,13 @@
 """
 from __future__ import annotations
 
+from typing import Any
+
+from app.core.mask_coverage import (
+    ITEM_FIELD_MISSING, ITEM_MISSED, ITEM_PROTECTED, MaskCoverageBatch,
+    MaskCoverageLedger, MaskCoverageItem, MaskRedoReceipt, is_field_protected,
+    make_coverage_ledger,
+)
 from app.core.models import (
     EventRecord, FieldEnrichRule, MaskMethod, MaskResult, MaskRule,
 )
@@ -94,7 +101,8 @@ class MaskEnrichPipeline:
     """
 
     def __init__(self, mask_rules: list[MaskRule] | None = None,
-                 enrich_rules: list[FieldEnrichRule] | None = None):
+                 enrich_rules: list[FieldEnrichRule] | None = None,
+                 ledger: MaskCoverageLedger | None = None):
         if mask_rules is None:
             mask_rules = PRESET_MASK_RULES
         if enrich_rules is None:
@@ -102,6 +110,8 @@ class MaskEnrichPipeline:
         self.mask_rules = mask_rules
         self.enrich_rules = enrich_rules
         self._mask_results: list[MaskResult] = []
+        # 脱敏覆盖批次台账：串联脱敏核验入口与质报汇总
+        self.coverage_ledger = ledger if ledger is not None else make_coverage_ledger()
 
     # ---------- 数据流 3: event_store → mask_rule → field_enrich → event_type ----------
 
@@ -167,36 +177,71 @@ class MaskEnrichPipeline:
             self._update_severity(record)
         return records
 
-    def verify_mask_completeness(self, records: list[EventRecord]) -> dict[str, Any]:
-        """验证脱敏完整性：检查是否有敏感值泄露（遗漏告警）。
+    def verify_mask_coverage(self, records: list[EventRecord]) -> MaskCoverageBatch:
+        """脱敏核验入口：逐字段核验并登记一代脱敏覆盖批次。
 
-        逐个检查 mask_results，确认掩码值不包含原始敏感数据核心部分。
-        返回遗漏清单和覆盖率。
+        对每条记录 × 每条脱敏规则判定覆盖项状态：
+        - 原字段缺失（无账号原值）→ field_missing，不进应保护分母；
+        - 掩码值有效（不同于原值且不含原值核心）→ protected；
+        - 其余（含未脱敏、掩码后仍泄露）→ missed。
+        批次登记进台账，供质报汇总按实际发布批次取证。
         """
-        leaks: list[dict[str, str]] = []
+        items: list[MaskCoverageItem] = []
         for record in records:
             for rule in self.mask_rules:
                 target = rule.target_field
                 original = record.parsed_fields.get(target, "")
-                masked = record.masked_fields.get(target, original)
                 if not original:
+                    items.append(MaskCoverageItem(
+                        record_ref=record.record_id, field_name=target,
+                        rule_id=rule.rule_id, status=ITEM_FIELD_MISSING,
+                    ))
                     continue
-                if len(original) > 3 and original[2:-2] in masked:
-                    leaks.append({
-                        "record_id": record.record_id,
-                        "field": target,
-                        "original_snippet": original[:50],
-                        "masked_snippet": masked[:50],
-                        "rule_id": rule.rule_id,
-                    })
-        total_fields = len(self.mask_rules)
-        covered = total_fields - len(leaks)
+                masked = record.masked_fields.get(target, original)
+                status = (ITEM_PROTECTED if is_field_protected(original, masked)
+                          else ITEM_MISSED)
+                items.append(MaskCoverageItem(
+                    record_ref=record.record_id, field_name=target,
+                    rule_id=rule.rule_id, status=status,
+                ))
+        return self.coverage_ledger.register_batch(items)
+
+    def verify_mask_completeness(self, records: list[EventRecord]) -> dict[str, Any]:
+        """验证脱敏完整性：检查是否有敏感值泄露（遗漏告警）。
+
+        覆盖率按脱敏覆盖批次计算：保护成功项 / 应保护项，
+        同一字段在多行漏遮盖时也不会出现负覆盖率。
+        返回的遗漏清单只带匿名来源位置，不带账号原文。
+        """
+        batch = self.verify_mask_coverage(records)
         return {
-            "total_rules": total_fields,
-            "leaks_found": len(leaks),
-            "leaks_detail": leaks,
-            "coverage_rate": round(covered / total_fields, 4) if total_fields else 1.0,
+            "total_rules": len(self.mask_rules),
+            "leaks_found": batch.missed_count(),
+            "leaks_detail": batch.missed_refs(),
+            "coverage_rate": batch.coverage_rate(),
+            "batch_id": batch.batch_id,
+            "generation": batch.generation,
+            "protected": batch.protected_count(),
+            "should_protect": batch.should_protect_count(),
+            "missed": batch.missed_count(),
+            "field_missing": batch.field_missing_count(),
+            "field_missing_refs": batch.field_missing_refs(),
         }
+
+    def redo_field(self, record_ref: str, field_name: str,
+                   records: list[EventRecord]) -> MaskRedoReceipt:
+        """保护侧补做入口：按匿名位置找到原行，只重放该字段对应的保护规则。
+
+        原来已保护的字段不会重新从原值回填；缺账号的行不能生成假保护成功。
+        回执需经 ledger.register_receipt 登记后才进入覆盖批次。
+        """
+        record = next((r for r in records if r.record_id == record_ref), None)
+        if record is None:
+            raise ValueError(f"匿名位置 {record_ref} 对应的记录不存在")
+        rule = next((r for r in self.mask_rules if r.target_field == field_name), None)
+        if rule is None:
+            raise ValueError(f"字段 {field_name} 没有对应的保护规则")
+        return self.coverage_ledger.complete_redo(record_ref, field_name, record, rule)
 
     def verify_enrich_mapping(self, expected_enrich_count: int) -> dict[str, Any]:
         """验证字段增强：检查是否有映射缺失。

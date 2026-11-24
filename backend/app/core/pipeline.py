@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from app.core.mask_coverage import MaskCoverageBatch
 from app.core.models import (
     BatchCheckpoint, EventRecord, EventTypeDef, IngestJob, IngestMetric,
     LogEntry, LogFormat, LogSourceConfig, ParseResultStatus, ParseRule,
@@ -352,18 +353,22 @@ class IngestPipeline:
 
     def generate_quality_report(self, metric: IngestMetric,
                                  parse_ok: int, parse_total: int,
-                                 fields_coverage: float,
+                                 fields_coverage: float = 0.0,
                                  processed: int = 0,
-                                 skipped: int = 0) -> QualityReport:
+                                 skipped: int = 0,
+                                 coverage_batch: "MaskCoverageBatch | None" = None) -> QualityReport:
         """从采集指标生成质量报告——对应 quality_report 模块。
 
         完整率 = 处理行数 / (处理+跳过)
         解析成功率 = 成功解析行数 / 总处理行数
-        字段覆盖率 = 已填充字段数 / 期望字段总数
+        字段覆盖率 = 脱敏覆盖批次的保护成功项 / 应保护项
+        （传入 coverage_batch 时以批次为准，分母不含原字段缺失项）
         """
         total = processed + skipped
         completeness = processed / total if total > 0 else 0.0
         parse_rate = parse_ok / parse_total if parse_total > 0 else 0.0
+        if coverage_batch is not None:
+            fields_coverage = coverage_batch.coverage_rate()
         return QualityReport(
             report_id=f"QUAL-{metric.metric_id}",
             source_id=metric.source_id,
